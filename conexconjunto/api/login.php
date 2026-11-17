@@ -3,32 +3,66 @@
 require __DIR__ . '/config.php';
 require __DIR__ . '/conexion.php';
 
-$usuario    = $_POST["usuario"];
+header("Content-Type: text/plain; charset=utf-8");
+
+if (
+    !isset($_POST["usuario"], $_POST["contrasena"]) ||
+    !is_string($_POST["usuario"]) ||
+    !is_string($_POST["contrasena"]) ||
+    $_POST["usuario"] === "" ||
+    $_POST["contrasena"] === ""
+) {
+    http_response_code(400);
+    exit;
+}
+
+$usuario = $_POST["usuario"];
 $contrasena = $_POST["contrasena"];
 
 try {
-    // La contraseña se guardó con SHA2 en la base, así que se compara con SHA2 también
-    $sql = "SELECT id_empleado FROM empleados
-    WHERE usuario = :usuario AND contrasena = SHA2(:contrasena, 256);";
+    $select = $conn->prepare(
+        "SELECT id_empleado, contrasena
+         FROM empleados
+         WHERE usuario = :usuario
+         LIMIT 1;"
+    );
+    $select->execute([":usuario" => $usuario]);
+    $empleado = $select->fetch();
 
-    // Execute the SQL query
-    $select = $conn->prepare($sql);
-    $select->bindParam(":usuario", $usuario);
-    $select->bindParam(":contrasena", $contrasena);
-    $select->execute();
-
-    // Process the result set
-    $id = "";
-    if ($select->rowCount() > 0) {
-        // Output data of each row
-        while($empleado = $select->fetch()) {
-            $id = $empleado["id_empleado"];
-        }
+    if (!$empleado) {
+        http_response_code(401);
+        exit;
     }
-    echo $id;   // vacío = usuario o contraseña incorrectos
+
+    $contrasenaGuardada = $empleado["contrasena"];
+    $hashContrasena = hash("sha256", $contrasena);
+
+    if (hash_equals($contrasenaGuardada, $hashContrasena)) {
+        echo $empleado["id_empleado"];
+        exit;
+    }
+
+    // Actualiza a SHA-256 las contraseñas en texto plano del respaldo inicial.
+    if (hash_equals($contrasenaGuardada, $contrasena)) {
+        $update = $conn->prepare(
+            "UPDATE empleados
+             SET contrasena = :hash
+             WHERE id_empleado = :id AND contrasena = :actual;"
+        );
+        $update->execute([
+            ":hash" => $hashContrasena,
+            ":id" => $empleado["id_empleado"],
+            ":actual" => $contrasenaGuardada
+        ]);
+
+        echo $empleado["id_empleado"];
+        exit;
+    }
+
+    http_response_code(401);
 }
-catch(PDOException $e) {
-    # echo "Error: " . $e->getMessage();
+catch (PDOException $e) {
+    http_response_code(500);
 }
 
 $conn = null;
