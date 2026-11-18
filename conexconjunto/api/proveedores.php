@@ -3,126 +3,248 @@
 require __DIR__ . '/config.php';
 require __DIR__ . '/conexion.php';
 
+header("Content-Type: application/json; charset=utf-8");
+
+function responder($datos, $codigo = 200)
+{
+    http_response_code($codigo);
+    echo json_encode($datos, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+function campoPostRequerido($campo)
+{
+    if (!isset($_POST[$campo]) || !is_string($_POST[$campo])) {
+        responder([
+            "success" => false,
+            "message" => "Falta el campo requerido: $campo."
+        ], 400);
+    }
+
+    $valor = trim($_POST[$campo]);
+    if ($valor === "") {
+        responder([
+            "success" => false,
+            "message" => "El campo $campo no puede estar vacío."
+        ], 400);
+    }
+
+    return $valor;
+}
+
+function longitudTexto($texto)
+{
+    return preg_match_all('/./us', $texto);
+}
+
+$acciones = ["buscar", "editar", "registrar", "modificar", "eliminar"];
+$accionesSolicitadas = [];
+foreach ($acciones as $accionDisponible) {
+    if (array_key_exists($accionDisponible, $_GET)) {
+        $accionesSolicitadas[] = $accionDisponible;
+    }
+}
+
+if (count($accionesSolicitadas) !== 1) {
+    responder([
+        "success" => false,
+        "message" => "Indica una sola acción: buscar, editar, registrar, modificar o eliminar."
+    ], 400);
+}
+
+$accion = $accionesSolicitadas[0];
+$metodo = $_SERVER["REQUEST_METHOD"];
+$metodoEsperado = in_array($accion, ["buscar", "editar"], true) ? "GET" : "POST";
+
+if ($metodo !== $metodoEsperado) {
+    header("Allow: " . $metodoEsperado . ", OPTIONS");
+    responder([
+        "success" => false,
+        "message" => "La acción $accion requiere el método $metodoEsperado."
+    ], 405);
+}
+
 try {
-
-    # C ---> INSERT
-    if (isset($_GET["registrar"])) {
-        $nombre    = $_POST["nombre_proveedor"];
-        $contacto  = $_POST["contacto"];
-        $categoria = $_POST["categoria"];
-
-        $sql = "INSERT INTO proveedores(nombre_proveedor, contacto, categoria)
-        VALUES (:nombre, :contacto, :categoria);";
-
-        // Prepare the SQL query template
-        $stmt = $conn->prepare($sql);
-        // Bind parameters
-        $stmt->bindParam(":nombre", $nombre);
-        $stmt->bindParam(":contacto", $contacto);
-        $stmt->bindParam(":categoria", $categoria);
-        $stmt->execute();
-
-        echo "ok";
-    }
-
-    # R ---> SELECT
-    elseif (isset($_GET["buscar"])) {
-        $busqueda = "";
-
-        if (isset($_GET["busqueda"])) {
-            $busqueda = $_GET["busqueda"];
+    if ($accion === "buscar") {
+        $busqueda = $_GET["busqueda"] ?? "";
+        if (!is_string($busqueda)) {
+            responder([
+                "success" => false,
+                "message" => "El parámetro busqueda debe ser texto."
+            ], 400);
         }
 
-        $busqueda = "%$busqueda%";
+        $patron = "%" . trim($busqueda) . "%";
+        $consulta = $conn->prepare(
+            "SELECT id_proveedor, nombre_proveedor, contacto, categoria
+             FROM proveedores
+             WHERE nombre_proveedor LIKE :nombre
+                OR contacto LIKE :contacto
+                OR categoria LIKE :categoria
+             ORDER BY nombre_proveedor;"
+        );
+        $consulta->execute([
+            ":nombre" => $patron,
+            ":contacto" => $patron,
+            ":categoria" => $patron
+        ]);
 
-        $sql = "SELECT * FROM proveedores
-        WHERE nombre_proveedor LIKE :busqueda1 OR categoria LIKE :busqueda2
-        ORDER BY nombre_proveedor;";
+        responder([
+            "success" => true,
+            "data" => $consulta->fetchAll()
+        ]);
+    }
 
-        // Execute the SQL query
-        $select = $conn->prepare($sql);
-        $select->bindParam(":busqueda1", $busqueda);
-        $select->bindParam(":busqueda2", $busqueda);
-        $select->execute();
+    if ($accion === "editar") {
+        $id = filter_var($_GET["id"] ?? null, FILTER_VALIDATE_INT, [
+            "options" => ["min_range" => 1]
+        ]);
+        if ($id === false) {
+            responder([
+                "success" => false,
+                "message" => "El parámetro id debe ser un entero positivo."
+            ], 400);
+        }
 
-        $array = array();
+        $consulta = $conn->prepare(
+            "SELECT id_proveedor, nombre_proveedor, contacto, categoria
+             FROM proveedores
+             WHERE id_proveedor = :id
+             LIMIT 1;"
+        );
+        $consulta->execute([":id" => $id]);
+        $proveedor = $consulta->fetch();
 
-        // Process the result set
-        if ($select->rowCount() > 0) {
-            // Output data of each row
-            while($row = $select->fetch()) {
-                $array[] = $row;
+        if (!$proveedor) {
+            responder([
+                "success" => false,
+                "message" => "No se encontró el proveedor."
+            ], 404);
+        }
+
+        responder([
+            "success" => true,
+            "data" => $proveedor
+        ]);
+    }
+
+    if ($accion === "registrar" || $accion === "modificar") {
+        $nombre = campoPostRequerido("nombre_proveedor");
+        $contacto = campoPostRequerido("contacto");
+        $categoria = campoPostRequerido("categoria");
+
+        $limites = [
+            "nombre_proveedor" => [ $nombre, 100 ],
+            "contacto" => [ $contacto, 100 ],
+            "categoria" => [ $categoria, 50 ]
+        ];
+        foreach ($limites as $campo => $limite) {
+            $longitud = longitudTexto($limite[0]);
+            if ($longitud === false || $longitud > $limite[1]) {
+                responder([
+                    "success" => false,
+                    "message" => "El campo $campo excede su longitud permitida."
+                ], 422);
             }
         }
 
-        header("Content-Type: application/json");
-        echo json_encode($array);
-        exit;
-    }
+        if ($accion === "registrar") {
+            $insertar = $conn->prepare(
+                "INSERT INTO proveedores (nombre_proveedor, contacto, categoria)
+                 VALUES (:nombre, :contacto, :categoria);"
+            );
+            $insertar->execute([
+                ":nombre" => $nombre,
+                ":contacto" => $contacto,
+                ":categoria" => $categoria
+            ]);
 
-    # U ---> UPDATE 
-    elseif (isset($_GET["editar"])) {
-        $id = $_GET["id"];
-
-        $sql = "SELECT * FROM proveedores
-        WHERE id_proveedor = :id
-        LIMIT 1;";
-
-        $select = $conn->prepare($sql);
-        $select->bindParam(":id", $id);
-        $select->execute();
-
-        $array = array();
-
-        if ($select->rowCount() > 0) {
-            while($row = $select->fetch()) {
-                $array[] = $row;
-            }
+            responder([
+                "success" => true,
+                "message" => "Proveedor registrado.",
+                "data" => ["id_proveedor" => (int) $conn->lastInsertId()]
+            ], 201);
         }
 
-        header("Content-Type: application/json");
-        echo json_encode($array);
-        exit;
+        $id = filter_var($_POST["id"] ?? null, FILTER_VALIDATE_INT, [
+            "options" => ["min_range" => 1]
+        ]);
+        if ($id === false) {
+            responder([
+                "success" => false,
+                "message" => "El campo id debe ser un entero positivo."
+            ], 400);
+        }
+
+        $actualizar = $conn->prepare(
+            "UPDATE proveedores
+             SET nombre_proveedor = :nombre, contacto = :contacto, categoria = :categoria
+             WHERE id_proveedor = :id;"
+        );
+        $actualizar->execute([
+            ":nombre" => $nombre,
+            ":contacto" => $contacto,
+            ":categoria" => $categoria,
+            ":id" => $id
+        ]);
+
+        $verificar = $conn->prepare(
+            "SELECT id_proveedor FROM proveedores WHERE id_proveedor = :id;"
+        );
+        $verificar->execute([":id" => $id]);
+        if (!$verificar->fetch()) {
+            responder([
+                "success" => false,
+                "message" => "No se encontró el proveedor."
+            ], 404);
+        }
+
+        responder([
+            "success" => true,
+            "message" => "Proveedor actualizado."
+        ]);
     }
 
-    elseif (isset($_GET["modificar"])) {
-        $id        = $_POST["id"];
-        $nombre    = $_POST["nombre_proveedor"];
-        $contacto  = $_POST["contacto"];
-        $categoria = $_POST["categoria"];
+    if ($accion === "eliminar") {
+        $id = filter_var($_POST["id"] ?? null, FILTER_VALIDATE_INT, [
+            "options" => ["min_range" => 1]
+        ]);
+        if ($id === false) {
+            responder([
+                "success" => false,
+                "message" => "El campo id debe ser un entero positivo."
+            ], 400);
+        }
 
-        $sql = "UPDATE proveedores
-        SET nombre_proveedor=:nombre, contacto=:contacto, categoria=:categoria
-        WHERE id_proveedor=:id;";
+        $eliminar = $conn->prepare(
+            "DELETE FROM proveedores WHERE id_proveedor = :id;"
+        );
+        $eliminar->execute([":id" => $id]);
 
-        $stmt = $conn->prepare($sql);
-        $stmt->bindParam(":nombre", $nombre);
-        $stmt->bindParam(":contacto", $contacto);
-        $stmt->bindParam(":categoria", $categoria);
-        $stmt->bindParam(":id", $id);
-        $stmt->execute();
+        if ($eliminar->rowCount() === 0) {
+            responder([
+                "success" => false,
+                "message" => "No se encontró el proveedor."
+            ], 404);
+        }
 
-        echo "ok";
-    }
-
-    # D ---> DELETE
-    elseif (isset($_GET["eliminar"])) {
-        $id = $_POST["id"];
-
-        $sql = "DELETE FROM proveedores WHERE id_proveedor=:id;";
-
-        $stmt = $conn->prepare($sql);
-        $stmt->bindParam(":id", $id);
-        $stmt->execute();
-
-        echo "ok";
+        responder([
+            "success" => true,
+            "message" => "Proveedor eliminado."
+        ]);
     }
 }
-catch(PDOException $e) {
-    // por ejemplo al borrar un proveedor que todavía tiene productos (ON DELETE RESTRICT)
-    http_response_code(400);
-    echo "error";
-    # echo "Error: " . $e->getMessage();
-}
+catch (PDOException $e) {
+    if ($accion === "eliminar" && $e->getCode() === "23000") {
+        responder([
+            "success" => false,
+            "message" => "No se puede eliminar: hay productos que usan este proveedor."
+        ], 409);
+    }
 
-$conn = null;
+    error_log($e->getMessage());
+    responder([
+        "success" => false,
+        "message" => "Ocurrió un error interno al procesar el proveedor."
+    ], 500);
+}
